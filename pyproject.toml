@@ -1,0 +1,13 @@
+[project]
+name = "ace-mcp"
+version = "0.1.0"
+description = "MCP server exposing the Akhil_Reporting client/task reporting view"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]",
+    "pyodbc",
+    "python-dotenv",
+]
+
+[tool.setuptools]
+packages = ["ace"]
