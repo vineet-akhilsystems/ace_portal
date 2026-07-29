@@ -87,15 +87,7 @@ after `DB_CACHE_TTL` seconds (default 120). Call `refresh_data()` to force it.
    ```
    py -m pip install -r requirements.txt
    ```
-2. Fill in `.env` (already configured):
-   ```
-   DB_HOST=43.242.214.195
-   DB_PORT=1433
-   DB_NAME=Akhil_Reporting
-   DB_USER=...
-   DB_PASSWORD=...
-   DB_DRIVER=ODBC Driver 17 for SQL Server
-   ```
+2. Fill in `.env` (already configured, see `.env.example` for the required keys).
 3. Test the DB connection:
    ```
    py scripts/test_connection.py
@@ -129,78 +121,7 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 Then restart Claude Desktop. Ask it e.g. *"show the latest 10 rows from the
 employee client report"*.
 
-## Deploying as a remote MCP server (Cloud Run)
-
-The server can run over Streamable HTTP instead of stdio, so it can be deployed
-to Cloud Run and added as a remote connector in Claude Code / Claude Desktop /
-other MCP clients, instead of only running on this machine.
-
-This is gated by two env vars (unset = local stdio behavior, unchanged):
-
-- `MCP_TRANSPORT=http` — switches transport from stdio to Streamable HTTP, listening on `0.0.0.0:$PORT`.
-- `MCP_AUTH_TOKEN=<random secret>` — every HTTP request must send `Authorization: Bearer <token>`, or gets a 401. **Set this** — the Cloud Run service itself is deployed publicly reachable (`--allow-unauthenticated`), since most MCP client UIs can't do Google IAM auth. This token is the only thing standing between the public internet and your client/ticket data.
-
-### 1. One-time GCP setup
-
-```
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
-
-# Generate a strong connector token and store secrets in Secret Manager
-# (PowerShell: use [Convert]::ToBase64String((1..32|%{Get-Random -Max 256})) or similar)
-python -c "import secrets; print(secrets.token_urlsafe(32))"   # copy this value
-
-echo -n "PASTE_THE_TOKEN_HERE" | gcloud secrets create ace-mcp-auth-token --data-file=-
-echo -n "your_db_password"      | gcloud secrets create ace-mcp-db-password --data-file=-
-```
-
-### 2. Deploy
-
-From the project root (this builds the `Dockerfile` via Cloud Build — no local Docker required):
-
-```
-gcloud run deploy ace-mcp \
-  --source . \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --set-env-vars DB_HOST=43.242.214.195,DB_PORT=1433,DB_NAME=Akhil_Reporting,DB_USER=your_username,MCP_TRANSPORT=http \
-  --set-secrets DB_PASSWORD=ace-mcp-db-password:latest,MCP_AUTH_TOKEN=ace-mcp-auth-token:latest
-```
-
-Note the HTTPS URL it prints (`https://ace-mcp-xxxxx.a.run.app`) — the MCP endpoint is `<that-url>/mcp`.
-
-### 3. Add it as a connector
-
-**Claude Code:**
-```
-claude mcp add --transport http ace-mcp https://ace-mcp-xxxxx.a.run.app/mcp \
-  --header "Authorization: Bearer PASTE_THE_TOKEN_HERE"
-```
-
-**Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "ace-mcp": {
-      "url": "https://ace-mcp-xxxxx.a.run.app/mcp",
-      "headers": { "Authorization": "Bearer PASTE_THE_TOKEN_HERE" }
-    }
-  }
-}
-```
-
-**claude.ai web custom connectors:** the web UI's "Add custom connector" flow is built around OAuth and may not expose a raw bearer-token/header field — check there before relying on it. Claude Code and Claude Desktop both support custom headers directly, so prefer those if the web UI doesn't cooperate.
-
-### Redeploying after code changes
-
-```
-gcloud run deploy ace-mcp --source . --region us-central1
-```
-(omit `--set-env-vars`/`--set-secrets` once set — Cloud Run keeps the previous revision's config unless you override it)
-
 ## Security
 
 - `.env` holds DB credentials in plaintext and is git-ignored — do not commit it.
 - The database is on a public IP; keep credentials private.
-- The Cloud Run deployment is publicly reachable network-wise; `MCP_AUTH_TOKEN` is the actual access control. Treat it like a password — rotate it via `gcloud secrets versions add ace-mcp-auth-token --data-file=-` followed by a redeploy if it ever leaks.
