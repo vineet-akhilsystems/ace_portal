@@ -40,20 +40,38 @@ def _run_http() -> None:
     # hostname. Cloud Run's own routing + MCP_AUTH_TOKEN are the real perimeter
     # here, so DNS-rebinding protection (meant for locally-bound dev servers) is
     # irrelevant for this deployment target.
+    
     mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = mcp.streamable_http_app()
 
     if token:
         class BearerAuthMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request: Request, call_next):
-                expected = f"Bearer {token}"
-                supplied = request.headers.get("authorization", "")
-                if not secrets.compare_digest(supplied, expected):
+                # OAuth-discovery probes must NOT be answered with 401. Clients like
+                # Claude's connector always poll these paths; a 401 makes them think
+                # the server is OAuth-protected and try (and fail) to register a
+                # client. Let them fall through to the app's natural 404, which
+                # signals "no OAuth here" so the client uses the ?key= auth instead.
+                path = request.url.path
+                if path == "/register" or path.startswith("/.well-known/"):
+                    return await call_next(request)
+
+                # Two accepted forms:
+                #   1. Authorization: Bearer <token>   (e.g. ChatGPT, CLI clients)
+                #   2. ?key=<token> in the URL          (for clients like Claude's
+                #      custom connector that can't set a static auth header)
+                expected_header = f"Bearer {token}"
+                supplied_header = request.headers.get("authorization", "")
+                header_ok = secrets.compare_digest(supplied_header, expected_header)
+
+                supplied_key = request.query_params.get("key", "")
+                query_ok = bool(supplied_key) and secrets.compare_digest(supplied_key, token)
+
+                if not (header_ok or query_ok):
                     print(
                         f"DEBUG auth reject: path={request.url.path} "
-                        f"auth_header_present={bool(supplied)} "
-                        f"auth_header_len={len(supplied)} "
-                        f"auth_header_prefix={supplied[:10]!r}"
+                        f"auth_header_present={bool(supplied_header)} "
+                        f"query_key_present={bool(supplied_key)}"
                     )
                     return PlainTextResponse("Unauthorized", status_code=401)
                 return await call_next(request)

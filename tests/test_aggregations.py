@@ -9,9 +9,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ace.aggregations import (  # noqa: E402
-    apply_filters, breakdown, contains, is_open, parse_date,
+    apply_filters, breakdown, confident_fuzzy_match, contains, is_open,
+    parse_date, resolve_employee,
 )
 from ace import insights  # noqa: E402
+
+NAME_ROWS = [{"Employee Name": n} for n in [
+    "Siddharth Sharma", "Ravi Singh", "Kuldeep Kumar", "Namit Kumar",
+    "Amit Kumar Gupta", "Disha Bakshi",
+]]
 
 TODAY = date(2026, 7, 24)
 
@@ -90,6 +96,63 @@ def test_clients_needing_attention_risk_order():
     clients = insights.clients_needing_attention(SAMPLE, TODAY, aged_days=30)
     assert clients[0]["client"] in {"Eye 7", "Ruby"}
     assert all("risk_score" in c for c in clients)
+
+
+def test_resolve_substring_first_and_last_name():
+    # first name, last name, and prefix all resolve via Tier-1 substring
+    m, s = resolve_employee(NAME_ROWS, "siddharth")
+    assert m == ["Siddharth Sharma"] and s == []
+    m, _ = resolve_employee(NAME_ROWS, "sharma")
+    assert m == ["Siddharth Sharma"]
+    m, _ = resolve_employee(NAME_ROWS, "sid")
+    assert m == ["Siddharth Sharma"]
+
+
+def test_resolve_ambiguous_common_surname_not_merged():
+    # 'Kumar' legitimately matches several different people -> all returned
+    m, s = resolve_employee(NAME_ROWS, "Kumar")
+    assert set(m) == {"Kuldeep Kumar", "Namit Kumar", "Amit Kumar Gupta"}
+    assert s == []
+
+
+def test_resolve_typo_first_name_suggests():
+    # misspelled first name has no substring match -> fuzzy suggestion
+    m, s = resolve_employee(NAME_ROWS, "Sidharth")
+    assert m == []
+    assert "Siddharth Sharma" in s
+
+
+def test_resolve_typo_last_name_suggests():
+    m, s = resolve_employee(NAME_ROWS, "Kuldeep Kumr")
+    assert m == []
+    assert s and s[0] == "Kuldeep Kumar"
+
+
+def test_resolve_garbage_rejected():
+    m, s = resolve_employee(NAME_ROWS, "zxcvbnm")
+    assert m == [] and s == []
+
+
+def test_confident_match_auto_resolves_clear_typo():
+    # 'kuldeep kumr' has one clear winner and no close rival -> auto-resolves
+    assert confident_fuzzy_match(NAME_ROWS, "Kuldeep Kumr") == "Kuldeep Kumar"
+
+
+def test_confident_match_declines_on_genuine_tie():
+    # 'Siddhart' is an exact prefix of BOTH names -> tie -> not auto-resolved
+    rows = NAME_ROWS + [{"Employee Name": "Siddharta Tiwari"}]
+    assert confident_fuzzy_match(rows, "Siddhart") is None
+
+
+def test_confident_match_resolves_clear_leader_over_distant_rival():
+    # 'sidharth' clearly favours Siddharth Sharma over the more distant
+    # Siddharta Tiwari -> auto-resolves to the clear leader
+    rows = NAME_ROWS + [{"Employee Name": "Siddharta Tiwari"}]
+    assert confident_fuzzy_match(rows, "Sidharth") == "Siddharth Sharma"
+
+
+def test_confident_match_none_for_garbage():
+    assert confident_fuzzy_match(NAME_ROWS, "zxcvbnm") is None
 
 
 if __name__ == "__main__":

@@ -11,13 +11,14 @@ Importing this module registers every tool on the shared `mcp` instance.
 from collections import Counter
 from datetime import datetime, timedelta
 
-from . import insights
+from . import duplicates, insights, leadership
 from .aggregations import (
     COUNTABLE,
     DATE_FIELDS,
     ageing_of,
     apply_filters,
     breakdown,
+    confident_fuzzy_match,
     contains,
     is_open,
     parse_date,
@@ -314,10 +315,21 @@ def _resolve_or_ambiguity(all_rows: list[dict], query: str):
     matches, returns (None, payload) where `payload` is the dict the calling
     tool should return as-is (not-found w/ fuzzy suggestions, or ambiguous
     w/ candidate list) instead of guessing or silently merging people.
+
+    A misspelling with ONE clearly-best fuzzy candidate (no close rival) is
+    auto-resolved to that person — the caller's result shows `employee` (the
+    corrected name) alongside `matched_query` (what was typed), so the fix is
+    visible. A typo that sits between two real people is NOT auto-resolved; it
+    falls through to `did_you_mean`.
     """
     matches, suggestions = resolve_employee(all_rows, query)
 
     if not matches:
+        guess = confident_fuzzy_match(all_rows, query)
+        if guess:
+            rows = [r for r in all_rows
+                    if str(r.get("Employee Name") or "").strip() == guess]
+            return guess, rows
         return None, {"employee": query, "found": False,
                        "did_you_mean": suggestions}
 
@@ -550,3 +562,303 @@ def priority_watch(aged_days: int = 30) -> dict:
     how much is open, unassigned and aged, plus the worst-offending open tickets.
     """
     return insights.priority_watch(get_rows(), _today(), int(aged_days))
+
+
+# --- deadlines, duplicates, trends, speed ---------------------------------
+@mcp.tool()
+def target_date_status(
+    only_open: bool = True,
+    due_soon_days: int = 7,
+    group_by: str = "employee",
+) -> dict:
+    """Where tickets stand against their Target Date — the deadline view.
+
+    Answers questions like "how many employees haven't met their target dates
+    yet?" (`employees_with_missed_targets` + the names list) and "what's
+    overdue / due soon?".
+
+    Each ticket is bucketed as:
+      * missed    — Target Date is already in the past (target NOT yet achieved)
+      * due_soon  — Target Date within the next `due_soon_days` days
+      * upcoming  — Target Date further out
+      * no_target_date — blank/unparseable Target Date
+
+    Args:
+        only_open:     consider only still-active tickets (default True). A
+                        closed ticket can't "miss" a future deadline, so leave
+                        this on for accountability questions.
+        due_soon_days: window (days) for the 'due_soon' bucket (default 7).
+        group_by:      'employee' (default), 'client', or 'none' — how to break
+                        down the missed/due_soon/upcoming counts.
+
+    Returns overall counts, the count + names of employees with missed targets,
+    a per-group breakdown (with each group's worst overdue days), and the worst
+    overdue tickets overall.
+    """
+    return insights.target_date_status(
+        get_rows(), _today(), only_open=bool(only_open),
+        due_soon_days=int(due_soon_days), group_by=group_by)
+
+
+@mcp.tool()
+def find_similar_tickets(
+    min_similarity: float = 0.5,
+    same_client_only: bool = False,
+    min_words: int = 4,
+    max_clusters: int = 40,
+) -> dict:
+    """Find duplicate / near-duplicate tickets — the same issue raised more than
+    once as separate ASPL tickets, even when worded differently.
+
+    Compares the word-set of each ticket's Description (Jaccard similarity, so
+    re-ordering and minor rewording still match) and groups matching tickets
+    into clusters. Use it to de-duplicate a backlog or spot repeatedly-reported
+    problems.
+
+    Args:
+        min_similarity:  0.0–1.0 threshold (default 0.5). 1.0 = identical
+                          wording; ~0.5 catches the same issue reworded. Lower
+                          it (e.g. 0.35) to catch looser/heavily-reworded
+                          matches, raise it (0.8+) for only near-exact copies.
+        same_client_only: if True, only group tickets from the same client
+                          (default False — the same bug can hit several clients).
+        min_words:        ignore tickets whose Description has fewer than this
+                          many distinctive words (default 4) — one-liners can't
+                          be judged reliably.
+        max_clusters:     max duplicate clusters to return (default 40).
+
+    Returns clusters_found, tickets_in_duplicate_clusters, and the clusters
+    (each with size, avg_similarity and the member tickets), biggest first.
+    """
+    return duplicates.find_similar(
+        get_rows(),
+        min_similarity=float(min_similarity),
+        same_client_only=bool(same_client_only),
+        min_words=int(min_words),
+        max_clusters=int(max_clusters),
+    )
+
+
+@mcp.tool()
+def activity_trend(
+    date_field: str = "raised",
+    period: str = "month",
+    last_n: int = 6,
+) -> dict:
+    """Ticket volume over time — how many were raised / completed / assigned per
+    week or month. Answers "how many did we close this month vs last?".
+
+    Args:
+        date_field: which date to bucket on — raised (default), completed,
+                     assigned, or target.
+        period:     'month' (default) or 'week'.
+        last_n:     keep only the most recent N buckets (default 6; 0 = all).
+
+    Returns a chronological series plus how many rows had a blank/unparseable
+    date for that field.
+    """
+    col = DATE_FIELDS.get(date_field)
+    if col is None:
+        raise ValueError(f"date_field must be one of {sorted(DATE_FIELDS)}")
+    if period not in ("month", "week"):
+        raise ValueError("period must be 'month' or 'week'")
+    return insights.activity_trend(
+        get_rows(), col, period=period, last_n=int(last_n))
+
+
+@mcp.tool()
+def resolution_time(group_by: str = "none", top: int = 30) -> dict:
+    """How fast tickets get resolved: CompletedOn - Date(raised), in days.
+
+    Only tickets that have BOTH a raised date and a completion date are measured
+    (see `coverage_pct` in the result). Optionally ranks groups slowest-average
+    first — good for "which employee/client/priority takes longest to close".
+
+    Args:
+        group_by: 'none' (default, overall stats only), 'employee', 'client',
+                   'priority', or 'task_type'.
+        top:       max groups to return when grouping (default 30).
+
+    Returns overall avg/median/min/max days and coverage, plus the per-group
+    breakdown when grouped.
+    """
+    return insights.resolution_time(get_rows(), group_by=group_by, top=int(top))
+
+
+# --- leadership: support people -------------------------------------------
+@mcp.tool()
+def stuck_tickets(min_days: int = 14, group_by: str = "employee",
+                  limit: int = 100) -> dict:
+    """Find open tickets that have gone quiet for a while — usually a sign the
+    person is BLOCKED (waiting on a client, a decision, another team), not that
+    they forgot. Use it to go unblock people, not to reprimand.
+
+    Args:
+        min_days:  how many days idle before a still-open ticket counts as stuck
+                    (default 14).
+        group_by:  'employee' (default), 'client', or 'none'.
+        limit:     max worst tickets to list (default 100).
+
+    Returns total stuck, how many were actively picked up but stalled, a status
+    breakdown, the per-group counts, and the worst offenders.
+    """
+    return leadership.stuck_tickets(
+        get_rows(), _today(), min_days=int(min_days), group_by=group_by,
+        limit=int(limit))
+
+
+@mcp.tool()
+def workload_balance(aged_days: int = 30) -> dict:
+    """Is the workload FAIR? Per-employee open / immediate / high / aged load
+    with a spread measure, plus explicit 'overloaded' and 'can absorb more'
+    lists — so you can rebalance and relieve people. Also flags weekend/
+    after-hours work (from WorkedOn timestamps, where present) as a burnout
+    signal. Purpose: support, not rank.
+
+    Args:
+        aged_days: ageing threshold (days) for the aged-open count (default 30).
+    """
+    return leadership.workload_balance(get_rows(), _today(), aged_days=int(aged_days))
+
+
+@mcp.tool()
+def employee_briefing(employee_name: str, aged_days: int = 30) -> dict:
+    """A supportive 1:1 prep pack for ONE employee — everything a manager needs
+    to have a HELPFUL conversation: current load, what's stuck (where they need
+    help), wins to recognise, missed targets, and whether those missed targets
+    are actually a systemic problem (their clients' deadlines being missed by
+    many people = not their fault), plus their module focus.
+
+    `employee_name` uses the same case-insensitive / ambiguity handling as
+    workload() — if it matches several people it returns the candidate list
+    instead of merging them; if nothing matches it returns fuzzy suggestions.
+    """
+    all_rows = get_rows()
+    exact_name, resolved = _resolve_or_ambiguity(all_rows, employee_name)
+    if exact_name is None:
+        return resolved
+    out = leadership.employee_briefing(
+        resolved, all_rows, _today(), exact_name, aged_days=int(aged_days))
+    out["matched_query"] = employee_name  # shows a typo auto-correction
+    return out
+
+
+# --- leadership: fix systemic problems ------------------------------------
+@mcp.tool()
+def problem_hotspots(group_by: str = "module", top: int = 10) -> dict:
+    """Which MODULE or CLIENT keeps generating pain — so you fix the system
+    instead of blaming individuals. Ranks by a pain score built from open load,
+    bug share, overdue rate, and rework (share of tickets that near-duplicate
+    others = wasted effort).
+
+    Args:
+        group_by: 'module' (default) or 'client'.
+        top:      how many hotspots to return (default 10).
+    """
+    if group_by not in ("module", "client"):
+        raise ValueError("group_by must be 'module' or 'client'")
+    return leadership.problem_hotspots(get_rows(), _today(), group_by=group_by,
+                                       top=int(top))
+
+
+@mcp.tool()
+def target_realism(group_by: str = "client", min_tickets: int = 5,
+                   top: int = 15) -> dict:
+    """Are the deadlines even realistic? Finds clients/modules/employees where
+    target dates are missed at a high rate ACROSS MANY people — a signal the
+    targets are unrealistic (a planning fix), not that individuals are failing.
+    Use it to defend the team with data.
+
+    Args:
+        group_by:    'client' (default), 'module', or 'employee'.
+        min_tickets: ignore groups with fewer than this many open-with-target
+                      tickets (default 5) to avoid noise.
+        top:         how many groups to return (default 15).
+    """
+    return leadership.target_realism(get_rows(), _today(), group_by=group_by,
+                                     min_tickets=int(min_tickets), top=int(top))
+
+
+@mcp.tool()
+def cycle_time_breakdown(group_by: str = "none", top: int = 15) -> dict:
+    """WHERE does work stall? Splits the pipeline into stages and times each:
+      triage    = raised -> assigned
+      pickup    = assigned -> worked
+      execution = worked -> completed
+      total     = raised -> completed
+    Slow triage or pickup is a process/queue problem, not an employee one. Each
+    stage reports its own coverage ('count') because WorkedOn is sparse.
+
+    Args:
+        group_by: 'none' (default, overall), 'employee', 'client', or 'module'.
+        top:      max groups when grouping (default 15).
+    """
+    return leadership.cycle_time_breakdown(get_rows(), group_by=group_by,
+                                           top=int(top))
+
+
+# --- leadership: recognise & grow -----------------------------------------
+@mcp.tool()
+def recognition(since: str | None = None, until: str | None = None,
+                top: int = 8) -> dict:
+    """The POSITIVE spotlight — who to thank or put forward for growth. Top
+    closers, fastest average resolvers, most Immediate fires handled, and best
+    target adherence. Most reports only find problems; this finds people doing
+    great work.
+
+    Args:
+        since / until: optional ISO 'YYYY-MM-DD' window on the COMPLETED date
+                        (e.g. 'this month'). Omit for all-time.
+        top:           how many people per category (default 8).
+    """
+    return leadership.recognition(get_rows(), _today(), since=since, until=until,
+                                  top=int(top))
+
+
+@mcp.tool()
+def expertise_map(by: str = "module", top: int = 12) -> dict:
+    """Who's the go-to SPECIALIST for each module/client (volume + completion),
+    and where is the BUS-FACTOR risk — areas where one person holds all the
+    knowledge (fragile if they're away, and often a person who's silently
+    carrying too much). Use it for smart assignment, spotting mentors, and
+    cross-training decisions.
+
+    Args:
+        by:  'module' (default) or 'client'.
+        top: how many areas to return (default 12).
+    """
+    if by not in ("module", "client"):
+        raise ValueError("by must be 'module' or 'client'")
+    return leadership.expertise_map(get_rows(), by=by, top=int(top))
+
+
+# --- leadership: flow & backlog health ------------------------------------
+@mcp.tool()
+def backlog_health(period: str = "month", last_n: int = 6) -> dict:
+    """Are we keeping up? Compares intake (tickets raised) vs throughput
+    (completed) per period, with net change, plus the current open backlog and
+    its aged share. net_change > 0 means the backlog grew that period.
+
+    Args:
+        period: 'month' (default) or 'week'.
+        last_n: most recent N periods to show (default 6; 0 = all).
+    """
+    if period not in ("month", "week"):
+        raise ValueError("period must be 'month' or 'week'")
+    return leadership.backlog_health(get_rows(), _today(), period=period,
+                                     last_n=int(last_n))
+
+
+@mcp.tool()
+def triage_gaps(slow_days: int = 3, limit: int = 50) -> dict:
+    """Where the INTAKE process fails people: unassigned Immediate/High tickets,
+    and tickets that sat a long time between raised and assigned. This is a
+    front-office/queue problem, not the assignee's fault.
+
+    Args:
+        slow_days: raised->assigned lag (days) that counts as slow triage
+                    (default 3).
+        limit:     max tickets to list per section (default 50).
+    """
+    return leadership.triage_gaps(get_rows(), _today(), slow_days=int(slow_days),
+                                  limit=int(limit))

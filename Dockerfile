@@ -1,4 +1,8 @@
-FROM python:3.12-slim
+# Pinned to bookworm (Debian 12): the MS ODBC repo below targets debian/12, and
+# bookworm's openssl.cnf carries the [system_default_sect]/CipherString policy
+# the TLS relaxation step edits. The unpinned tag floated to trixie (Debian 13),
+# which broke both assumptions.
+FROM python:3.12-slim-bookworm
 
 # --- Microsoft ODBC Driver 17 for SQL Server (required by pyodbc) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -15,6 +19,28 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+# Old SQL Server only supports TLS 1.0/1.1; OpenSSL 3 (Debian 12) blocks it by
+# default (SECLEVEL=2, min TLS 1.2), which makes the ODBC pre-login TLS handshake
+# fail with "SSL routines::unsupported protocol". Debian's stock openssl.cnf has
+# no [system_default_sect] to edit, so ship a self-contained relaxed config and
+# point OpenSSL at it via OPENSSL_CONF. SECLEVEL=0 + MinProtocol TLSv1 lets the
+# handshake negotiate down to what the legacy server offers.
+RUN set -eux; printf '%s\n' \
+    'openssl_conf = openssl_init' \
+    '' \
+    '[openssl_init]' \
+    'ssl_conf = ssl_sect' \
+    '' \
+    '[ssl_sect]' \
+    'system_default = system_default_sect' \
+    '' \
+    '[system_default_sect]' \
+    'CipherString = DEFAULT@SECLEVEL=0' \
+    'MinProtocol = TLSv1' \
+    > /etc/ssl/relaxed-openssl.cnf; \
+    cat /etc/ssl/relaxed-openssl.cnf
+ENV OPENSSL_CONF=/etc/ssl/relaxed-openssl.cnf
 
 ENV MCP_TRANSPORT=http
 ENV PYTHONUNBUFFERED=1

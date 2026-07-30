@@ -76,37 +76,107 @@ def _normalize_ws(s) -> str:
     return " ".join(str(s).split()).lower()
 
 
-def resolve_employee(rows: list[dict], query: str):
-    """Resolve a user-typed name against the distinct Employee Name values.
+def _token_sim(qtok: str, ntok: str) -> float:
+    """Similarity 0..1 between ONE query token and ONE name token."""
+    if qtok == ntok:
+        return 1.0
+    # prefix / initial: 'sid' -> 'siddharth', 's' -> 'sharma'
+    if ntok.startswith(qtok) or qtok.startswith(ntok):
+        return 0.95
+    if qtok in ntok or ntok in qtok:
+        return 0.9
+    return difflib.SequenceMatcher(None, qtok, ntok).ratio()
 
-    Case-insensitive substring match first (e.g. "siddharth" -> "Siddharth
-    Sharma"). A query like "Kumar" can legitimately match several different
-    people here (Kuldeep Kumar, Namit Kumar, Amit Kumar Gupta, ...) — that's
-    real ambiguity in the data, not a bug, so callers must handle >1 match.
 
-    If nothing contains the query (likely a typo), falls back to fuzzy
-    matching against all distinct names so a close spelling still surfaces.
-    Fuzzy matching is ONLY used as that fallback — never mixed with substring
-    results — because names differing by one letter (e.g. "Siddharth Sharma"
-    vs "Siddharta Tiwari") are different people, not typos of each other.
+def _query_name_score(qtokens: list[str], ntokens: list[str]) -> float:
+    """Token-aware match score for a whole query against a whole name.
 
-    Returns (exact_matches, fuzzy_suggestions): `exact_matches` is the list
-    of distinct names containing `query`; `fuzzy_suggestions` is populated
-    only when `exact_matches` is empty.
+    Each query token must find a *decent* name token (best >= 0.5) or the
+    match is rejected outright; otherwise the score is the average of the
+    per-token best matches. This lets a misspelled first name still match
+    ('sidharth' -> 'Siddharth Sharma') and a first-name-or-last-name-only query
+    score high, while a single strong token can't drag in an unrelated person
+    ('sharma qwerty' is rejected because 'qwerty' matches nothing)."""
+    if not qtokens or not ntokens:
+        return 0.0
+    bests = [max((_token_sim(qt, nt) for nt in ntokens), default=0.0)
+             for qt in qtokens]
+    if min(bests) < 0.5:
+        return 0.0
+    return sum(bests) / len(bests)
+
+
+def resolve_employee(rows: list[dict], query: str, fuzzy_cutoff: float = 0.72):
+    """Resolve a user-typed name against the distinct Employee Name values,
+    tolerant of typos, first/last-name-only queries, initials and variations.
+
+    Two tiers:
+
+    * **Tier 1 — substring** on the full normalized name (e.g. "siddharth",
+      "sharma", "sid" all hit "Siddharth Sharma"). Treated as real matches. A
+      query like "Kumar" can legitimately match several *different* people
+      (Kuldeep Kumar, Namit Kumar, ...) — real ambiguity, so callers must
+      handle >1 match and must NOT silently merge them.
+
+    * **Tier 2 — token-aware fuzzy** fallback, used ONLY when Tier 1 finds
+      nothing (likely a misspelling). Scores each distinct name with
+      `_query_name_score` so "Sidharth", "Kuldeep Kumr", "S Sharma" still
+      surface the right person. Returned as *suggestions*, never as matches —
+      names one letter apart can be different people, so a human/LLM confirms.
+
+    Returns (matches, suggestions): `matches` is the Tier-1 substring list;
+    `suggestions` (best-first) is populated only when `matches` is empty.
     """
     names = distinct_employee_names(rows)
-    q = _normalize_ws(query)
-    if not q:
+    qn = _normalize_ws(query)
+    if not qn:
         return [], []
-    matches = [n for n in names if q in _normalize_ws(n)]
-    if matches:
-        return matches, []
-    suggestions = difflib.get_close_matches(
-        _normalize_ws(query), [_normalize_ws(n) for n in names], n=5, cutoff=0.6)
-    # map normalized suggestions back to their original (as-stored) names
-    by_norm = {_normalize_ws(n): n for n in names}
-    suggestions = [by_norm[s] for s in suggestions]
-    return [], suggestions
+
+    substr = [n for n in names if qn in _normalize_ws(n)]
+    if substr:
+        return substr, []
+
+    return [], [n for n, _ in scored_fuzzy_candidates(rows, query, fuzzy_cutoff)[:5]]
+
+
+def scored_fuzzy_candidates(rows: list[dict], query: str,
+                            cutoff: float = 0.72) -> list[tuple[str, float]]:
+    """The Tier-2 fuzzy candidates as (name, score) pairs, best-first. Only
+    meaningful when there is no substring match. Shared by `resolve_employee`
+    (which drops the scores) and `confident_fuzzy_match` (which needs them)."""
+    names = distinct_employee_names(rows)
+    qn = _normalize_ws(query)
+    if not qn:
+        return []
+    qtokens = qn.split()
+    scored = [(n, _query_name_score(qtokens, _normalize_ws(n).split()))
+              for n in names]
+    scored = [(n, s) for n, s in scored if s >= cutoff]
+    scored.sort(key=lambda ns: ns[1], reverse=True)
+    return scored
+
+
+def confident_fuzzy_match(rows: list[dict], query: str,
+                          min_score: float = 0.85, margin: float = 0.10):
+    """Return the ONE unambiguous best fuzzy name for a misspelling, or None.
+
+    Auto-resolving a typo is only safe when there is a clear single winner:
+    the top candidate must clear `min_score` AND stand clear of the runner-up
+    by `margin`. So "swadin" -> "Swadhin Kumar Senapati" resolves (no rival),
+    and "sidharth" resolves to "Siddharth Sharma" (a clear leader over the more
+    distant "Siddharta Tiwari"). But a shared-prefix tie like "Siddhart" — an
+    exact prefix of BOTH those names — does NOT resolve; it stays a suggestion
+    for a human/LLM to confirm. Whether a substring match existed first is the
+    caller's job to check; this only inspects the fuzzy pool."""
+    cands = scored_fuzzy_candidates(rows, query)
+    if not cands:
+        return None
+    top_name, top_score = cands[0]
+    if top_score < min_score:
+        return None
+    if len(cands) > 1 and (top_score - cands[1][1]) < margin:
+        return None
+    return top_name
 
 
 def is_open(row: dict) -> bool:

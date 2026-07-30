@@ -166,7 +166,7 @@ Grouped by the kind of MCP tool that would serve them.
 
 ---
 
-## 5. The implemented tool set (14 tools)
+## 5. The implemented tool set (30 tools)
 
 **Primitives** — compose almost any question:
 
@@ -197,6 +197,35 @@ Grouped by the kind of MCP tool that would serve them.
 | `clients_needing_attention(aged_days, top)` ✅ | Clients ranked by escalation risk. |
 | `priority_watch(aged_days)` ✅ | Is Immediate/High work being handled — open, unassigned, aged + worst offenders. |
 
+**Deadlines / duplicates / trends / speed (added 2026-07-29):**
+
+| Tool | Answers |
+|------|---------|
+| `target_date_status(only_open, due_soon_days, group_by)` ✅ | Tickets vs their Target Date: missed / due_soon / upcoming / no_target. "How many **employees haven't met their target dates**?" → `employees_with_missed_targets` + names. Grouped by employee or client, with worst-overdue per group. |
+| `find_similar_tickets(min_similarity, same_client_only, min_words, max_clusters)` ✅ | **Duplicate / near-duplicate** detection — the same issue raised as separate ASPL tickets, even reworded. Word-set (Jaccard) similarity + clustering. |
+| `activity_trend(date_field, period, last_n)` ✅ | Ticket **volume over time** (raised/completed/assigned/target) per week or month. "How many closed this month vs last?" |
+| `resolution_time(group_by, top)` ✅ | **How fast** tickets resolve = CompletedOn − Date(raised), in days. Overall + per employee/client/priority/task_type (slowest first). Reports `coverage_pct` (only tickets with both dates). |
+
+**Leadership / people-support (added 2026-07-29)** — reframes the data around
+*supporting* people and fixing the *system*, not policing individuals. Pure
+logic lives in `ace/leadership.py`. Data honesty: the view is a snapshot (no
+change history → no reopen/reassignment tracking); `WorkedOn` is ~14% filled so
+pickup/effort signals are directional; and `Employee Name` sometimes holds a
+hospital name (schema §4) so employee rankings can include non-person rows.
+
+| Tool | Answers / purpose |
+|------|-------------------|
+| `stuck_tickets(min_days, group_by, limit)` ✅ | Open tickets idle too long → someone is likely **blocked**. "Who do I need to unblock?" |
+| `workload_balance(aged_days)` ✅ | Is the load **fair**? Per-person open/immediate/aged + spread + over/under-loaded lists + after-hours flag. For rebalancing/relief. |
+| `employee_briefing(employee_name, aged_days)` ✅ | A supportive **1:1 pack** for one person: load, what's stuck, wins to recognise, missed targets, and whether those are systemic (not their fault). |
+| `problem_hotspots(group_by, top)` ✅ | Which **module/client keeps breaking** — pain score from open, bug share, overdue, and rework (duplicate) density. Fix the system. |
+| `target_realism(group_by, min_tickets, top)` ✅ | Where deadlines are missed by **many people** → targets are unrealistic, not individuals failing. Defends the team. |
+| `cycle_time_breakdown(group_by, top)` ✅ | **Where work stalls**: triage (raised→assigned), pickup (assigned→worked), execution (worked→completed). Process fix, not people. |
+| `recognition(since, until, top)` ✅ | The **positive spotlight** — top closers, fastest resolvers, most Immediate handled, best target adherence. Who to thank/promote. |
+| `expertise_map(by, top)` ✅ | Go-to **specialists** per module/client + **bus-factor risk** (knowledge stuck in one person). Assignment, mentoring, cross-training. |
+| `backlog_health(period, last_n)` ✅ | **Intake vs throughput** per period + net change + current open backlog. Are we keeping up? |
+| `triage_gaps(slow_days, limit)` ✅ | Unassigned Immediate/High + slow raised→assigned tickets. The **intake process** failing people. |
+
 ✅ = implemented & tested against the live DB.
 
 **Definitions used by the insight tools:**
@@ -225,3 +254,8 @@ is flaky. See README → *Caching*.
 | "Average ageing per priority." | `count_by('Priority Name', avg_ageing=True)` |
 | "What was raised in the last 7 days?" | `search_tickets(date_field='raised', last_days=7)` |
 | "Details of ASPL-165661." | `get_ticket('165661')` |
+| "How many employees haven't met their target dates yet?" | `target_date_status()` |
+| "What's overdue / due this week, and who owns it?" | `target_date_status(group_by='employee')` |
+| "Find duplicate or repeated tickets (same issue, worded differently)." | `find_similar_tickets(min_similarity=0.5)` |
+| "How many tickets did we close each month?" | `activity_trend(date_field='completed', period='month')` |
+| "How long do tickets take to resolve, by priority?" | `resolution_time(group_by='priority')` |

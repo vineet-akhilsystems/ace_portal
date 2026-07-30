@@ -8,6 +8,8 @@ already-fetched rows so it can be unit-tested offline.
 "Open" = ASPL Status is not a done status (see aggregations.DONE_ASPL_STATUSES).
 "Aged" = ageing (Agening, days) >= aged_days AND still open.
 """
+from datetime import timedelta
+
 from .aggregations import (
     PRIORITY_ORDER,
     ageing_of,
@@ -189,6 +191,182 @@ def priority_watch(rows, today, aged_days=30, worst=5):
                 for r in open_rows_sorted[:worst]
             ],
         }
+    return result
+
+
+def target_date_status(rows, today, only_open=True, due_soon_days=7,
+                       group_by="employee", top=50):
+    """Where do tickets stand against their Target Date?
+
+    Classifies each ticket (open-only by default) into:
+      * missed    — Target Date is in the past (target NOT achieved yet)
+      * due_soon  — Target Date within the next `due_soon_days`
+      * upcoming  — Target Date further out
+      * no_target — Target Date blank/unparseable
+
+    Answers "how many employees haven't met their target dates" via
+    `employees_with_missed_targets`, and can group the counts by employee or
+    client.
+    """
+    scope = [r for r in rows if is_open(r)] if only_open else list(rows)
+    missed, due_soon, upcoming, no_target = [], [], [], []
+    horizon = today + timedelta(days=max(0, int(due_soon_days)))
+    for r in scope:
+        d = parse_date(r.get("Target Date"))
+        if d is None:
+            no_target.append(r)
+        elif d < today:
+            missed.append(r)
+        elif d <= horizon:
+            due_soon.append(r)
+        else:
+            upcoming.append(r)
+
+    emps_missed = sorted({str(r.get("Employee Name") or "").strip()
+                          for r in missed
+                          if str(r.get("Employee Name") or "").strip()})
+
+    grouped = None
+    if group_by in ("employee", "client"):
+        col = "Employee Name" if group_by == "employee" else "Client Name"
+        by = {}
+        for bucket_name, bucket in (("missed", missed), ("due_soon", due_soon),
+                                    ("upcoming", upcoming)):
+            for r in bucket:
+                k = str(r.get(col) or "").strip()
+                if not k:
+                    continue
+                g = by.setdefault(k, {"missed": 0, "due_soon": 0, "upcoming": 0,
+                                      "worst_overdue_days": 0})
+                g[bucket_name] += 1
+                if bucket_name == "missed":
+                    d = parse_date(r.get("Target Date"))
+                    if d is not None:
+                        g["worst_overdue_days"] = max(
+                            g["worst_overdue_days"], (today - d).days)
+        grouped = [{"value": k, **v} for k, v in by.items()]
+        grouped.sort(key=lambda x: (x["missed"], x["worst_overdue_days"]),
+                     reverse=True)
+        grouped = grouped[:top]
+
+    worst = sorted(
+        missed, key=lambda r: (today - parse_date(r["Target Date"])).days,
+        reverse=True)
+    worst_list = [{
+        "aspl": r.get("ASPL#"),
+        "client": r.get("Client Name"),
+        "employee": r.get("Employee Name"),
+        "priority": r.get("Priority Name"),
+        "status": r.get("ASPL Status"),
+        "target_date": r.get("Target Date"),
+        "days_overdue": (today - parse_date(r["Target Date"])).days,
+    } for r in worst[:top]]
+
+    return {
+        "scope": "open only" if only_open else "all tickets",
+        "counts": {
+            "missed": len(missed),
+            "due_soon": len(due_soon),
+            "upcoming": len(upcoming),
+            "no_target_date": len(no_target),
+        },
+        "employees_with_missed_targets": len(emps_missed),
+        "employee_names_with_missed_targets": emps_missed,
+        "grouped_by": group_by if group_by in ("employee", "client") else None,
+        "grouped": grouped,
+        "worst_overdue": worst_list,
+    }
+
+
+def activity_trend(rows, col, period="month", last_n=6):
+    """Count tickets per time bucket for a date column (raised/completed/etc).
+
+    `col` is the actual column name (e.g. 'Date', 'CompletedOn'). `period` is
+    'month' or 'week'. Returns a chronological series plus how many rows had an
+    unparseable/blank date.
+    """
+    buckets = {}
+    unparsed = 0
+    for r in rows:
+        d = parse_date(r.get(col))
+        if d is None:
+            unparsed += 1
+            continue
+        if period == "week":
+            iso = d.isocalendar()
+            key = f"{iso[0]}-W{iso[1]:02d}"
+        else:
+            key = f"{d.year}-{d.month:02d}"
+        buckets[key] = buckets.get(key, 0) + 1
+    series = sorted(buckets.items())  # zero-padded keys sort chronologically
+    if last_n and last_n > 0:
+        series = series[-last_n:]
+    return {
+        "date_column": col,
+        "period": period,
+        "counted": sum(n for _, n in series),
+        "unparsed_or_blank_dates": unparsed,
+        "series": [{"bucket": k, "count": n} for k, n in series],
+    }
+
+
+def _duration_stats(vals):
+    if not vals:
+        return None
+    s = sorted(vals)
+    n = len(s)
+    median = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    return {
+        "count": n,
+        "avg_days": round(sum(s) / n, 1),
+        "median_days": round(median, 1),
+        "min_days": s[0],
+        "max_days": s[-1],
+    }
+
+
+def resolution_time(rows, group_by="none", top=30):
+    """How long tickets take to resolve = CompletedOn - Date(raised), in days.
+
+    Only tickets that have BOTH a raised date and a CompletedOn are measured
+    (see `coverage_pct`). Optionally grouped by employee / client / priority /
+    task_type, ranked slowest-average first.
+    """
+    durations = []  # (row, days)
+    for r in rows:
+        raised = parse_date(r.get("Date"))
+        done = parse_date(r.get("CompletedOn"))
+        if raised and done:
+            days = (done - raised).days
+            if days >= 0:
+                durations.append((r, days))
+
+    result = {
+        "note": ("Resolution time = CompletedOn - Date(raised), in days, for "
+                 "tickets that have both dates."),
+        "measured_tickets": len(durations),
+        "total_tickets": len(rows),
+        "coverage_pct": (round(100 * len(durations) / len(rows), 1)
+                         if rows else 0),
+        "overall": _duration_stats([d for _, d in durations]),
+    }
+
+    if group_by != "none":
+        col = {"employee": "Employee Name", "client": "Client Name",
+               "priority": "Priority Name", "task_type": "Task Name"}.get(group_by)
+        if col is None:
+            raise ValueError(
+                "group_by must be one of: none, employee, client, priority, "
+                "task_type")
+        groups = {}
+        for r, d in durations:
+            k = str(r.get(col) or "").strip()
+            if k:
+                groups.setdefault(k, []).append(d)
+        ranked = [{"value": k, **_duration_stats(v)} for k, v in groups.items()]
+        ranked.sort(key=lambda x: x["avg_days"], reverse=True)
+        result["by_" + group_by] = ranked[:top]
+
     return result
 
 

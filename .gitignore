@@ -5,3 +5,5 @@ __pycache__/
 venv/
 .claude
 tests/
+CLAUDE.MD
+helper.txt
