@@ -19,6 +19,23 @@ EC2 instance ──► Caddy (ports 80/443, auto Let's Encrypt cert)
 The examples use the current instance, IP `16.4.24.168`. If your IP is
 different, use your own everywhere you see it.
 
+## Current deployment at a glance
+
+| Item | Value |
+|---|---|
+| Code repo | https://github.com/vineet-akhilsystems/ace_portal (branch `main`) |
+| AWS region | `ap-south-1` (Mumbai) |
+| Instance | Amazon Linux 2023, x86_64, 1 GB RAM + 1 GB swap, 8 GB disk |
+| Public IP / DNS | `16.4.24.168` / `ec2-16-4-24-168.ap-south-1.compute.amazonaws.com` |
+| SSH | `ssh -i ace_portal.pem ec2-user@<public DNS>` |
+| Code on instance | `/opt/ace-mcp` (git clone of the repo) |
+| Secrets on instance | `/etc/ace-mcp/secrets` (root-only, never in git) |
+| Containers | `ace-mcp` (app, `127.0.0.1:8080`) and `caddy` (HTTPS, ports 80/443) |
+| Public endpoint | `https://16-4-24-168.sslip.io/mcp` |
+
+> The older Cloud Run deployment (`ace-mcp` in GCP project `akhil-mcp-server`,
+> `us-central1`) is separate. It keeps running until you shut it down.
+
 ---
 
 ## Step 0 — Prerequisites (AWS console)
@@ -92,10 +109,14 @@ Check with: `docker --version && git --version && swapon --show`.
 
 ## Step 3 — Give the instance read access to the GitHub repo
 
-The repo `vineet-akhilsystems/ace_portal` is private, so the instance
-needs its own credentials. Use a **deploy key**: an SSH key that can read this
-one repo and nothing else. Don't put your personal GitHub password or token on
-the server.
+The code lives at https://github.com/vineet-akhilsystems/ace_portal.
+
+- **Public repo:** skip this step. In Step 4, clone over HTTPS instead.
+  Making the repo private is recommended, though:
+  `docs/TROUBLESHOOTING_CLOUD_RUN_DB.md` contains the DB username.
+- **Private repo (recommended):** the instance needs its own credentials. Use a
+  **deploy key**: an SSH key that can read this one repo and nothing else.
+  Don't put your personal GitHub password or token on the server.
 
 **3a. Create the key on the instance:**
 
@@ -139,9 +160,15 @@ ssh -T git@github.com
 
 sudo mkdir -p /opt/ace-mcp
 sudo chown ec2-user:ec2-user /opt/ace-mcp
+# Private repo (deploy key from Step 3):
 git clone git@github.com:vineet-akhilsystems/ace_portal.git /opt/ace-mcp
+# Public repo (no key needed):
+# git clone https://github.com/vineet-akhilsystems/ace_portal.git /opt/ace-mcp
+
 cd /opt/ace-mcp && git log --oneline -3
 ```
+
+The newest commit shown should match the latest commit on GitHub's `main`.
 
 The repo's git-ignore rules keep the local credentials file out of git, so
 **no secrets come with the clone**. You add them in the next step.
@@ -304,7 +331,15 @@ chats.
 
 ## Updating to new code
 
-Push your changes to GitHub from your PC, then on the instance:
+On your PC, commit and push to `main`:
+
+```bash
+git add <changed files>
+git commit -m "Describe the change"
+git push origin main          # origin = github.com/vineet-akhilsystems/ace_portal
+```
+
+Then on the instance:
 
 ```bash
 cd /opt/ace-mcp
