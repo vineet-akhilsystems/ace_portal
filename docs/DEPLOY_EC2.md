@@ -224,7 +224,7 @@ applies the TLS 1.0 relaxation needed by the old SQL Server (see
 `TROUBLESHOOTING_CLOUD_RUN_DB.md`).
 
 ```bash
-docker run -d --name ace-mcp \
+sudo docker run -d --name ace-mcp \
   --restart unless-stopped \
   --env-file /etc/ace-mcp/secrets \
   -p 127.0.0.1:8080:8080 \
@@ -233,6 +233,10 @@ docker run -d --name ace-mcp \
 docker logs -f ace-mcp     # Ctrl+C to stop following
 ```
 
+- **`sudo` is required here.** The `docker` command reads `--env-file`
+  itself, as your user, and the secrets file is root-only. Without `sudo` you
+  get `open /etc/ace-mcp/secrets: permission denied`. Don't loosen the file's
+  permissions; just use `sudo` for `docker run`.
 - **`127.0.0.1:8080`** means the app can only be reached from the instance
   itself. The internet reaches it only through Caddy (HTTPS).
 - **`--restart unless-stopped`** brings it back after crashes and reboots.
@@ -346,7 +350,7 @@ cd /opt/ace-mcp
 git pull
 docker build -t ace-mcp .
 docker rm -f ace-mcp
-docker run -d --name ace-mcp --restart unless-stopped \
+sudo docker run -d --name ace-mcp --restart unless-stopped \
   --env-file /etc/ace-mcp/secrets -p 127.0.0.1:8080:8080 ace-mcp
 docker image prune -f        # free disk from old images (8 GB fills up)
 ```
@@ -371,6 +375,7 @@ env file.
 | Tool call → timeout / `TCP Provider` error | SQL Server firewall blocks the EC2 IP | add the instance IP to the DB allowlist |
 | Every request → `401` | wrong token, or `MCP_AUTH_TOKEN` missing | compare with `/etc/ace-mcp/secrets` |
 | Build killed / very slow | out of memory | add swap (Step 2) or use a larger instance |
+| `docker run` → `open /etc/ace-mcp/secrets: permission denied` | the docker client reads the env file as your user; the file is root-only | use `sudo docker run ...` (keep the file `600`) |
 
 Useful commands: `docker ps`, `docker logs --tail 100 ace-mcp`,
 `docker logs --tail 100 caddy`, `df -h /`, `free -m`.
